@@ -2,215 +2,262 @@
 
 ## 1. Project objective
 
-Build a configurable human-presence controller using **Hi-Link LD2410 + PIR + MCU** to automatically control an external switch/load.
+Build a **firmware-focused human-presence controller** using **Hi-Link LD2410 + optional PIR + MCU**.
+
+The main goal is to develop and validate the **logic/code** that decides when an output should turn ON or OFF based on human presence.
 
 Core behavior:
 
-> Detect human presence → turn output ON → keep output ON while presence remains → when presence is lost, wait for a user-configured OFF delay → turn output OFF.
+> Detect person → output ON → keep ON while person is present, including when stationary → when presence is lost, wait for configurable OFF delay → output OFF.
 
-The project focuses on **firmware/algorithm design**, especially sensor fusion, presence validation, state management, and configurable timing.
+PIR is an **optional supporting sensor** and can be enabled or disabled by configuration.
+
+The project intentionally keeps hardware complexity low. The main work is the **presence algorithm, state machine, timers, filtering, configuration, and reliable firmware behavior**.
 
 ## 2. System architecture
 
 ```text
-                  ┌──────────────┐
-                  │     PIR      │
-                  │  Movement    │
-                  └──────┬───────┘
-                         │ GPIO
-                         ▼
+                 ┌──────────────┐
+                 │     PIR      │
+                 │   OPTIONAL   │
+                 └──────┬───────┘
+                        │ GPIO
+                        ▼
 ┌──────────────┐   ┌───────────────┐
 │    LD2410    │──►│      MCU      │
-│              │UART│               │
-│ Presence     │   │ Sensor Fusion │
-│ Moving       │   │ Validation    │
-│ Static       │   │ State Machine │
-│ Distance/Gate│   │ Timer         │
+│    UART      │   │               │
+│              │   │ Presence Logic│
+│ Moving       │   │ State Machine │
+│ Static       │   │ Timer         │
+│ Distance/Gate│   │ Configuration │
 └──────────────┘   └───────┬───────┘
                            │
                            ▼
-                    ┌──────────────┐
-                    │ Output Driver│
-                    │ Relay/MOSFET │
-                    └──────┬───────┘
-                           │
-                           ▼
-                         LOAD
+                      OUTPUT CONTROL
 ```
 
-## 3. Sensor responsibilities
+The MCU is the center of the system. Sensors only provide input; the MCU makes the final decision.
 
-### LD2410 — primary presence sensor
+## 3. Sensor logic
 
-Use LD2410 as the main source for human-presence information. Its moving/static target information and distance/gate data are used by the MCU to determine whether a valid presence remains.
+### LD2410 — primary sensor
 
-Important principle:
+LD2410 is the main source of human-presence information.
 
-- LD2410 reporting no movement does **not** automatically mean no person.
-- A stationary person can still be considered present.
-- LD2410 data must be filtered/validated before changing the output state.
+Use:
 
-### PIR — motion/event support sensor
+- valid target/presence information;
+- moving target information;
+- static target information;
+- distance/gate information;
+- configurable thresholds and filtering.
 
-Use PIR as a complementary motion detector.
+Important rule:
 
-PIR is useful for:
+> **No movement does not mean no person.**
 
-- detecting a new movement event quickly;
-- supporting initial presence confirmation;
-- providing an independent motion signal.
+A person can remain stationary while the output must stay ON.
 
-Important principle:
+### PIR — optional sensor
 
-> PIR = 0 does not mean that no person is present.
+PIR is only a **supporting motion/event sensor**.
 
-Therefore PIR must not be used alone as the OFF condition.
+It can be enabled or disabled:
+
+```text
+PIR_ENABLE = 0 → ignore PIR
+PIR_ENABLE = 1 → use PIR as supporting input
+```
+
+PIR can help with:
+
+- detecting a movement event quickly;
+- supporting initial detection;
+- providing an independent motion indication.
+
+PIR must not be the main source for determining that a person has left.
+
+Important rule:
+
+> **PIR = 0 must never directly mean “no person”.**
 
 ## 4. Main firmware flow
 
 ```text
 START
   │
-  ├─ Initialize MCU peripherals
+  ├─ Initialize MCU
   ├─ Initialize LD2410 UART
-  ├─ Initialize PIR input
+  ├─ Initialize PIR GPIO if enabled
   ├─ Initialize timer/tick
-  └─ Load user configuration
+  └─ Load configuration
   │
   ▼
-MAIN LOOP
+MAIN LOOP / TASK
   │
-  ├─ Receive and parse LD2410 frames
-  ├─ Read PIR state/event
-  ├─ Validate LD2410 data
+  ├─ Receive LD2410 data
+  ├─ Parse and validate frame
+  ├─ Read PIR if enabled
   ├─ Evaluate presence
   ├─ Run state machine
-  ├─ Update ON/OFF timers
-  └─ Control output
+  ├─ Update timers
+  └─ Update output
   │
   └──────────────► repeat
 ```
 
+The implementation should be deterministic and easy to debug.
+
 ## 5. Presence decision logic
 
-The first version should keep the logic deterministic and easy to debug.
+The presence engine converts sensor data into one logical result:
 
-### Presence = TRUE when
+```text
+presence = TRUE / FALSE
+```
 
-- LD2410 reports a valid target/presence according to configured detection criteria; or
-- a valid PIR event is used as a supporting trigger and LD2410 confirms presence.
+### Presence = TRUE
 
-### Presence = FALSE when
+Normally when LD2410 reports a valid target according to the configured criteria.
 
-- LD2410 has no valid presence for the configured loss-confirmation period.
+If `PIR_ENABLE = 1`, a valid PIR event may support the detection, but the final presence decision should still be controlled by the presence logic rather than treating PIR as a standalone presence sensor.
 
-PIR alone must not force Presence = FALSE.
+### Presence = FALSE
+
+Only after LD2410 has indicated that valid presence is absent for the configured **loss-confirmation period**.
+
+Do not use these rules:
+
+```text
+PIR = 0              → NO PERSON   ❌
+LD2410 no movement   → NO PERSON   ❌
+No single frame      → NO PERSON   ❌
+```
+
+Instead, use validated LD2410 information plus timing/filtering.
 
 ## 6. State machine
 
 Use four primary states:
 
 ```text
-             valid presence
-NO_PERSON ───────────────────► DETECTING
-   ▲                              │
-   │                         confirmation OK
-   │                              ▼
-   │                           ACTIVE
-   │                              │
-   │                         presence lost
-   │                              ▼
-   └──── timeout ◄────────── WAIT_OFF
-                                  │
-                         presence returns
-                                  │
-                                  └──────► ACTIVE
+                    valid presence
+NO_PERSON ─────────────────────────► DETECTING
+   ▲                                    │
+   │                              confirmed
+   │                                    ▼
+   │                                  ACTIVE
+   │                                    │
+   │                              presence lost
+   │                                    ▼
+   └──────── timeout ◄──────────── WAIT_OFF
+                                      │
+                               presence returns
+                                      │
+                                      └────► ACTIVE
 ```
 
-### NO_PERSON
+### `NO_PERSON`
 
-- Output = OFF
-- Waiting for a valid presence event.
+- Output = OFF.
+- Wait for valid presence.
 
-### DETECTING
+### `DETECTING`
 
-- Confirm that the detection is valid.
-- Optional ON delay/debounce can be applied.
-- Avoid reacting to a single noisy sample.
+- Confirm that detection is valid.
+- Apply optional ON delay/debounce.
+- Reject short/noisy detections if required.
 
-### ACTIVE
+### `ACTIVE`
 
 - Output = ON.
 - Continue monitoring LD2410.
-- PIR may be inactive while a stationary person remains detected.
-- Any valid presence resets/cancels the OFF timer.
+- A stationary person must keep the system active when LD2410 still reports valid presence.
+- Any valid presence cancels/resets the OFF timer.
 
-### WAIT_OFF
+### `WAIT_OFF`
 
 - Output remains ON.
-- Start the user-configured OFF timer.
-- If presence returns before timeout: cancel timer and return to ACTIVE.
-- If timeout expires with no valid presence: turn output OFF and return to NO_PERSON.
+- Start the configurable `OFF_DELAY` timer.
+- If presence returns before timeout → cancel timer → `ACTIVE`.
+- If timeout expires with no valid presence → output OFF → `NO_PERSON`.
 
 ## 7. Configurable parameters
 
-Initial configuration should include:
+The firmware should expose a small configuration structure:
 
 | Parameter | Purpose |
 |---|---|
-| `ON_DELAY` | Time used to confirm presence before turning output ON |
-| `OFF_DELAY` | Time without valid presence before turning output OFF |
+| `ON_DELAY` | Confirmation time before turning output ON |
+| `OFF_DELAY` | Time to wait after presence is lost |
 | `LD2410_MAX_DISTANCE` | Maximum useful detection distance |
-| `LD2410_GATE_CONFIG` | LD2410 distance-gate configuration |
-| `MOVING_THRESHOLD` | Moving-target sensitivity/threshold |
-| `STATIC_THRESHOLD` | Static-target sensitivity/threshold |
+| `MOVING_THRESHOLD` | Moving-target threshold |
+| `STATIC_THRESHOLD` | Static-target threshold |
+| `LD2410_GATE_CONFIG` | Distance-gate configuration |
 | `PIR_ENABLE` | Enable/disable PIR support |
+| `PRESENCE_LOSS_CONFIRM` | Time used to confirm presence loss |
 
-Default example for development only:
-
-```text
-ON_DELAY  = 0.5 s
-OFF_DELAY = 30 s
-```
-
-Defaults are not final product values and must be validated experimentally.
-
-## 8. Important timing behavior
-
-Example with `OFF_DELAY = 30 s`:
+Example development values only:
 
 ```text
-Person present
-      │
-      ▼
-OUTPUT ON
-      │
-      │ person remains
-      │
-      ▼
-OUTPUT stays ON
-      │
-      │ presence lost
-      ▼
-WAIT_OFF
-      │
-      ├── person returns ──► ACTIVE
-      │
-      └── 30 s expires ───► OUTPUT OFF
+ON_DELAY             = 0.5 s
+OFF_DELAY            = 30 s
+PRESENCE_LOSS_CONFIRM = 1 s
+PIR_ENABLE           = 1
 ```
 
-The timer should be restarted/reset whenever valid presence is detected.
+These values are not final and must be adjusted during testing.
+
+## 8. Core timing logic
+
+Example: `OFF_DELAY = 30 s`.
+
+```text
+LD2410 detects person
+        │
+        ▼
+      ACTIVE
+        │
+        │ valid presence continues
+        │ → OFF timer remains cancelled/reset
+        │
+        ▼
+   presence lost
+        │
+        ▼
+    WAIT_OFF
+        │
+        ├── presence returns ──► ACTIVE
+        │
+        └── 30 s expires ──────► NO_PERSON / OUTPUT OFF
+```
+
+The important behavior is:
+
+```text
+valid presence detected
+        → cancel OFF timer
+
+presence lost
+        → start OFF timer
+
+presence returns before timeout
+        → cancel OFF timer
+        → keep output ON
+
+OFF timer expires
+        → output OFF
+```
 
 ## 9. Firmware architecture
 
-Separate the firmware into modules rather than putting all logic in `main()`.
+The project should focus primarily on clean code organization.
 
 ```text
 firmware/
 ├── main
 ├── ld2410_driver
-├── pir_driver
-├── sensor_fusion
+├── pir_driver          # optional
 ├── presence_engine
 ├── state_machine
 ├── timer_manager
@@ -218,117 +265,113 @@ firmware/
 └── config_manager
 ```
 
-Suggested responsibilities:
+### Module responsibilities
 
-- `ld2410_driver`: UART receive, frame parser, LD2410 configuration.
-- `pir_driver`: PIR GPIO/event handling.
-- `sensor_fusion`: combine LD2410 and PIR information.
-- `presence_engine`: validate presence and apply filtering.
-- `state_machine`: manage NO_PERSON/DETECTING/ACTIVE/WAIT_OFF.
-- `timer_manager`: ON delay, OFF delay, periodic tick.
-- `output_controller`: relay/MOSFET/output state.
-- `config_manager`: load/save user settings.
+- `ld2410_driver`: UART reception, frame parsing, data validation, LD2410 configuration.
+- `pir_driver`: optional PIR GPIO/event handling.
+- `presence_engine`: convert sensor data into logical presence.
+- `state_machine`: control `NO_PERSON`, `DETECTING`, `ACTIVE`, `WAIT_OFF`.
+- `timer_manager`: ON delay, OFF delay, loss-confirmation timer, periodic tick.
+- `output_controller`: set output ON/OFF and maintain safe startup behavior.
+- `config_manager`: store and validate user parameters.
+- `main`: initialization and high-level execution flow.
 
-Interrupts should be kept short. UART/PIR/timer interrupts should capture events or data; the main loop/task should perform the heavier parsing and decision logic.
+Avoid putting the entire algorithm inside `main()`.
 
-## 10. Development phases
+## 10. Development phases — firmware first
 
-### Phase 1 — Hardware bring-up
+### Phase 1 — Define logic
 
-- [ ] Verify MCU power and I/O.
-- [ ] Verify LD2410 UART communication.
-- [ ] Verify PIR digital signal.
-- [ ] Verify output driver.
-- [ ] Confirm electrical levels and safe isolation where required.
+- [ ] Define presence criteria.
+- [ ] Define `NO_PERSON`, `DETECTING`, `ACTIVE`, `WAIT_OFF`.
+- [ ] Define ON/OFF timing behavior.
+- [ ] Define PIR optional behavior.
+- [ ] Define configuration structure.
 
 ### Phase 2 — LD2410 driver
 
-- [ ] Implement UART reception.
+- [ ] Implement UART receive.
 - [ ] Implement frame synchronization/parsing.
-- [ ] Extract moving/static presence and distance/gate information.
-- [ ] Add invalid-frame handling.
-- [ ] Log raw and parsed data during testing.
+- [ ] Extract moving/static/distance information.
+- [ ] Validate frames.
+- [ ] Handle communication/data errors.
 
-### Phase 3 — PIR driver
+### Phase 3 — Presence engine
 
-- [ ] Read PIR signal reliably.
-- [ ] Add debounce/event handling if required by the selected PIR.
-- [ ] Verify behavior for entering, moving, and leaving.
+- [ ] Convert LD2410 data to `presence = TRUE/FALSE`.
+- [ ] Add filtering and confirmation time.
+- [ ] Ensure stationary presence remains valid.
+- [ ] Add optional PIR support.
+- [ ] Verify `PIR_ENABLE = 0` completely disables PIR influence.
 
-### Phase 4 — Presence engine
+### Phase 4 — State machine + timer
 
-- [ ] Define valid LD2410 presence criteria.
-- [ ] Add filtering/confirmation time.
-- [ ] Combine PIR as supporting information.
-- [ ] Ensure stationary people remain detected.
+- [ ] Implement all four states.
+- [ ] Implement `ON_DELAY`.
+- [ ] Implement `OFF_DELAY`.
+- [ ] Implement presence-loss confirmation.
+- [ ] Reset/cancel OFF timer when presence returns.
+- [ ] Prevent rapid ON/OFF oscillation.
 
-### Phase 5 — State machine + timer
-
-- [ ] Implement NO_PERSON.
-- [ ] Implement DETECTING.
-- [ ] Implement ACTIVE.
-- [ ] Implement WAIT_OFF.
-- [ ] Implement configurable ON/OFF delays.
-- [ ] Cancel/reset OFF timer when presence returns.
-
-### Phase 6 — Configuration
+### Phase 5 — Configuration
 
 - [ ] Define configuration structure.
-- [ ] Add non-volatile storage.
-- [ ] Add a configuration interface appropriate to the selected MCU.
 - [ ] Validate parameter ranges.
+- [ ] Add runtime configuration if required.
+- [ ] Add non-volatile storage if required.
 
-### Phase 7 — Output control
+### Phase 6 — Output control
 
-- [ ] Implement relay/MOSFET control.
-- [ ] Add startup-safe output state.
-- [ ] Verify behavior during reset/reboot.
-- [ ] Verify fail-safe behavior.
+- [ ] Implement simple output abstraction.
+- [ ] Keep startup output safe.
+- [ ] Ensure state-machine decisions are correctly reflected at the output.
 
-### Phase 8 — Real-world validation
+### Phase 7 — Logic validation
 
-Test at minimum:
+Test the firmware logic with sensor input scenarios:
 
 1. No person.
-2. Person enters.
-3. Person remains moving.
-4. Person remains stationary.
+2. Person appears.
+3. Person moves.
+4. Person stays stationary.
 5. Person leaves.
-6. Person returns before OFF timeout.
-7. False PIR trigger without a valid person.
-8. LD2410 temporary detection loss.
-9. Multiple environmental conditions.
-10. MCU reset while output is ON.
+6. Person returns before `OFF_DELAY` expires.
+7. Person returns after timeout.
+8. PIR enabled.
+9. PIR disabled.
+10. PIR inactive while LD2410 still detects a stationary person.
+11. Invalid/noisy LD2410 frame.
+12. Temporary LD2410 communication loss.
 
 ## 11. Success criteria
 
-The first stable version is considered successful when:
+The firmware is successful when:
 
-- A valid person reliably turns the output ON.
-- A stationary person does not cause an unwanted OFF.
-- Leaving the detection area starts the OFF timer.
-- Returning before timeout cancels the OFF action.
-- Output turns OFF only after the configured delay has expired.
-- PIR loss alone never incorrectly turns the system OFF.
-- Invalid/noisy sensor data does not cause rapid ON/OFF oscillation.
-- Configuration survives reboot when non-volatile storage is implemented.
+- LD2410 detection turns the output ON reliably.
+- Stationary presence does not incorrectly turn the output OFF.
+- Presence loss starts the OFF timer only after confirmation.
+- Returning before timeout cancels the OFF timer.
+- Output turns OFF only after the configured delay.
+- `PIR_ENABLE = 0` makes PIR irrelevant to the decision.
+- PIR cannot independently force the system OFF.
+- Invalid/noisy data does not cause rapid state changes.
+- The state machine can be tested independently from the physical output hardware.
 
 ## 12. Future extensions
 
-Possible future improvements:
+Only add complexity when testing shows a need.
 
-- Multiple output channels.
-- Multiple configurable distance zones using LD2410 gates.
-- Ambient-light sensor for automatic lighting decisions.
-- Local buttons/display or a PC/mobile configuration interface.
-- Event logging.
-- Low-power operating modes where practical.
-- Additional filtering or confidence scoring after real-world test data is collected.
+Possible extensions:
+
+- runtime configuration interface;
+- multiple outputs;
+- configurable LD2410 distance zones;
+- event logging;
+- diagnostic/debug mode;
+- additional sensors if the LD2410 alone proves insufficient.
 
 ## 13. Design principle
 
-Keep the project modular:
+> **LD2410 provides the primary presence evidence. PIR is optional supporting information. The presence engine decides presence. The state machine decides behavior. The timer decides when OFF is allowed. The output controller applies the final command.**
 
-> **Sensors provide evidence. The MCU decides presence. The state machine decides behavior. The timer decides when an action is allowed. The output driver controls the external load.**
-
-Do not add more sensors or complexity until testing demonstrates a real need.
+The project should prioritize **clear, deterministic, testable firmware logic** over unnecessary hardware complexity.
